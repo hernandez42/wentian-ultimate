@@ -17,17 +17,19 @@ DB = '/root/data/ano_weather.db'
 # v1.1.2: 问天数据导出 (C权威, Python只读)
 WENTIAN_JSON = '/root/data/fusion/wentian_latest.json'
 LAT, LON = 25.09917, 102.92667  # ⚠ 2026-09-07: 修正为长水机场真坐标(原25.0820导致数据偏差)
-ALT = 2115
-FEISHU_USER = 'ou_52a5a07c6c4c825ccb530efe5befcc77'
+ALT = 2103  # 长水机场ZPPP真海拔 2103.5m
+FEISHU_USER = os.environ.get('FEISHU_USER_ID', 'ou_52a5a07c6c4c825ccb530efe5befcc77')
 
 # ── 网络 ──────────────────────────────────────────────────────────
-def _ctx() -> ssl.SSLContext:
+def _ctx(insecure: bool = True) -> ssl.SSLContext:
+    """SSL context: insecure=True用于外部API(Open-Meteo等), insecure=False用于飞书(需验证)"""
     c = ssl.create_default_context()
-    c.check_hostname = False
-    c.verify_mode = ssl.CERT_NONE
+    if insecure:
+        c.check_hostname = False
+        c.verify_mode = ssl.CERT_NONE
     return c
 
-def _fetch(url: str, timeout: int = 15, retries: int = 3) -> Optional[bytes]:
+def _fetch(url: str, timeout: int = 15, retries: int = 3, insecure: bool = True) -> Optional[bytes]:
     """统一网络抓取 - 带重试(5xx/超时指数退避), 最终失败返回None而不是 'ERR:..'字符串
     ⚠ 修复(2026-09-05): 旧版无重试, Open-Meteo一次503整条推送实况全变0"""
     import time as _t
@@ -35,7 +37,7 @@ def _fetch(url: str, timeout: int = 15, retries: int = 3) -> Optional[bytes]:
     for attempt in range(1, retries + 1):
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'curl/7.81.0'})
-            with urllib.request.urlopen(req, timeout=timeout, context=_ctx()) as r:
+            with urllib.request.urlopen(req, timeout=timeout, context=_ctx(insecure)) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
             last_err = e
@@ -403,7 +405,7 @@ def _section_current(cur: Dict, uno: Optional[Dict], wx_code: int,
         f'  UV: {uv_now:.1f}  能见度: {vis/1000:.1f}km'
     ]
     if uno:
-        L.append(f'  📡 机柜实测: {uno["T"]:.1f}°C / 湿度{uno["rh"]:.0f}% / 海平面气压{uno["p_sea"]:.1f}hPa')
+        L.append(f'  📡 机柜实测: {_safe_float(uno.get("T"), 0):.1f}°C / 湿度{_safe_float(uno.get("rh"), 0):.0f}% / 海平面气压{_safe_float(uno.get("p_sea"), 0):.1f}hPa')
     if wentian_used or stale_note:
         src = stale_note or '本地DB缓存(Open-Meteo暂不可达)'
         L.append(f'  ⚠ 实况来源: {src} (非实时, 数据可能滞后)')
@@ -477,8 +479,9 @@ def _section_today(daily: Dict, hourly: Dict, today: datetime.date) -> List[str]
         f'  风: {wind_dir(wind_dom)}风 {wind_max:.0f}km/h',
         f'  日出: {sr}  日落: {ss}'
     ])
-    if sn['day_temps'] or sn['night_temps']:
+    if sn['day_temps']:
         L.append(f'  白天详情: {day_ic} {day_tx} {min(sn["day_temps"]):.0f}~{max(sn["day_temps"]):.0f}°C')
+    if sn['night_temps']:
         L.append(f'  夜间详情: {night_ic} {night_tx} {min(sn["night_temps"]):.0f}~{max(sn["night_temps"]):.0f}°C')
     return L
 
@@ -520,11 +523,10 @@ def _section_6day(daily: Dict) -> List[str]:
                 if rain >= 5: wx_text, wx_ic = '雨', '🌧'
                 elif rain >= 1: wx_text, wx_ic = '阵雨', '🌦'
                 else: wx_text, wx_ic = '多云', '⛅'
-                prob = min(100, int(rain * 25))
                 L.append(f'  {dt.strftime("%m/%d")} 周{wd_cn[dt.weekday()]}: {wx_ic} {wx_text:<4} '
-                         f'{tmin:.0f}~{tmax:.0f}°C  💧{rain:.1f}mm({prob}%)')
-            except:
-                pass
+                         f'{tmin:.0f}~{tmax:.0f}°C  💧{rain:.1f}mm')
+            except Exception as e:
+                print(f'[_section_6day] WeatherNext解析跳过: {e}')
         return L
     
     # fallback: Open-Meteo daily
@@ -606,9 +608,11 @@ def _section_analysis(wentian: Optional[Dict]) -> List[str]:
         wl = nc.get('warning_level', '无')
         ic = '✅' if wl in ('无', '', None) else '⚠️'
         L.append(f'  {ic} 短临Nowcast(0-30min): {nc["forecast"]} | 雷暴评分{_g(nc, "score", default=0)}/100 告警={wl}')
+        pwv_v = _g(nc, "pwv_current", default=None)
+        pwv_str = '不可用' if (pwv_v is None or pwv_v <= 0.5) else f'{pwv_v:.1f}mm'
         L.append(f'     五型评分 ⛈{_g(nc, "thunder_score", default=0)} 🌪{_g(nc, "squall_score", default=0)} '
                  f'🌫{_g(nc, "stationary_score", default=0)} 💨{_g(nc, "wind_shear_score", default=0)} '
-                 f'| PWV {_g(nc, "pwv_current", default=0):.1f}mm')
+                 f'| PWV {pwv_str}')
         shown += 1
 
     # 3. PWV反演 + 多源S4融合 (模块17/23)
@@ -861,15 +865,8 @@ def build_message(om: Dict, uno: Optional[Dict], ult: Optional[Dict],
         else:
             stale_note = '无任何实时数据源 (Open-Meteo不可达且DB无缓存)'
 
-    # 当前小时weather_code (优先hourly实时)
+    # 当前小时weather_code (从current获取)
     wx_code = _safe_int(cur.get('weather_code', 0))
-    cur_hour_iso = cur.get('time', '')
-    if hourly.get('time') and hourly.get('weather_code'):
-        try:
-            ix = hourly['time'].index(cur_hour_iso)
-            wx_code = _safe_int(hourly['weather_code'][ix])
-        except (ValueError, IndexError) as e:
-            print(f'[build_message] hourly查找失败: {e}')
 
     # 拼接7个段落
     L = []
@@ -900,10 +897,10 @@ def _get_tenant_token(secret: str) -> Optional[str]:
     try:
         req = urllib.request.Request(
             'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
-            data=json.dumps({'app_id':'cli_aae86c7e07235bed','app_secret':secret}).encode(),
+            data=json.dumps({'app_id':os.environ.get('FEISHU_APP_ID','cli_aae86c7e07235bed'),'app_secret':secret}).encode(),
             headers={'Content-Type':'application/json'}
         )
-        with urllib.request.urlopen(req, timeout=10, context=_ctx()) as r:
+        with urllib.request.urlopen(req, timeout=10, context=_ctx(insecure=False)) as r:
             return json.loads(r.read()).get('tenant_access_token', '')
     except (urllib.error.URLError, json.JSONDecodeError) as e:
         print(f'[_get_tenant_token] 失败: {e}')
@@ -921,7 +918,7 @@ def _send_msg(token: str, msg: str) -> bool:
         headers={'Authorization':'Bearer '+token, 'Content-Type':'application/json'}
     )
     try:
-        with urllib.request.urlopen(req, timeout=10, context=_ctx()) as r:
+        with urllib.request.urlopen(req, timeout=10, context=_ctx(insecure=False)) as r:
             result = json.loads(r.read())
             if result.get('code') == 0:
                 return True
