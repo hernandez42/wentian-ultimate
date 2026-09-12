@@ -6,12 +6,13 @@ v8.0 (2026-09-06): 推送前调用DeepSeek进行多源数据LLM深度分析, 新
 v1.1.2 (2026-09-03): 加入 wentian 22维度签名, 修复NoneType.format错误
 v7.0: MCP优化 (complexity 48→25, 修SQL列名, 移除except:pass)
 """
-import sys, os, json, urllib.request, ssl, sqlite3
+import sys, os, json, re, urllib.request, ssl, sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 
 sys.path.insert(0, '/root/.hermes')
+sys.path.insert(0, '/root/scripts')
 FUSION_DIR = '/root/data/fusion'
 DB = '/root/data/ano_weather.db'
 # v1.1.2: 问天数据导出 (C权威, Python只读)
@@ -19,6 +20,14 @@ WENTIAN_JSON = '/root/data/fusion/wentian_latest.json'
 LAT, LON = 25.09917, 102.92667  # ⚠ 2026-09-07: 修正为长水机场真坐标(原25.0820导致数据偏差)
 ALT = 2103  # 长水机场ZPPP真海拔 2103.5m
 FEISHU_USER = os.environ.get('FEISHU_USER_ID', 'ou_52a5a07c6c4c825ccb530efe5befcc77')
+
+# R9 (2026-09-09): 钦天监 + 中国传统天象模块 (主人明示"必须结合中国传统天象")
+try:
+    from qintianjian_calendar import get_qintianjian, render_push_section as _qintianjian_render
+    HAS_QINTIANJIAN = True
+except Exception as _qt_e:
+    print(f'[qintianjian] 模块加载失败: {_qt_e}')
+    HAS_QINTIANJIAN = False
 
 # ── 网络 ──────────────────────────────────────────────────────────
 def _ctx(insecure: bool = True) -> ssl.SSLContext:
@@ -89,33 +98,195 @@ def wind_dir(deg: Optional[float]) -> str:
     dirs = ['北', '东北', '东', '东南', '南', '西南', '西', '西北']
     return dirs[int((deg + 22.5) // 45) % 8]
 
-# ── 1. 拉Open-Meteo 7天预报 ──────────────────────────────────────
+# ── 1. 拉实况 + 7天预报 (从C引擎outdoor表 + 多模型融合) ─────
 def fetch_openmeteo() -> Dict[str, Any]:
-    url = (
-        f'https://api.open-meteo.com/v1/forecast?'
-        f'latitude={LAT}&longitude={LON}'
-        f'&current=temperature_2m,relative_humidity_2m,dew_point_2m,apparent_temperature,'
-        f'precipitation,weather_code,cloud_cover,surface_pressure,pressure_msl,'
-        f'wind_speed_10m,wind_direction_10m,wind_gusts_10m,uv_index,visibility'
-        f'&hourly=temperature_2m,relative_humidity_2m,precipitation_probability,'
-        f'precipitation,cloud_cover,visibility,wind_speed_10m,wind_direction_10m,pressure_msl'
-        f'&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,'
-        f'precipitation_probability_max,precipitation_hours,wind_speed_10m_max,'
-        f'wind_direction_10m_dominant,uv_index_max,sunrise,sunset'
-        f'&timezone=Asia/Shanghai&forecast_days=7'
-    )
-    d = _fetch(url)
-    if not d:
-        return {}
+    """
+    v4.0: 不再直接调Open-Meteo API
+    实况: 从问天DB outdoor表读(C引擎用met.no主源)
+    预报: 从多模型融合JSON读 (5模型: WN2+ECMWF+GFS+ICON+GEM)
+    Open-Meteo API仅在最末兜底时调用
+    """
+    result = {'current': {}, 'hourly': {}, 'daily': {}}
+    
+    # 1. 实况: 从C引擎outdoor表
     try:
-        return json.loads(d)
-    except json.JSONDecodeError as e:
-        print(f'[fetch_openmeteo] JSON解析失败: {e}')
-        return {}
+        with sqlite3.connect('/root/data/wentian.db') as c:
+            row = c.execute(
+                "SELECT temp, humid, pressure, wind_s, wind_d, weather, precip, "
+                "       cloud, uv, vis, ts "
+                "FROM outdoor ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+        if row and row[0] is not None:
+            result['current'] = {
+                'temperature_2m': row[0],
+                'relative_humidity_2m': row[1],
+                'pressure_msl': row[2],
+                'wind_speed_10m': row[3],
+                'wind_direction_10m': row[4],
+                'weather_code': _to_wmo(row[5]),
+                'precipitation': row[6] or 0,
+                'cloud_cover': row[7] or 0,
+                'uv_index': row[8] or 0,
+                'visibility': row[9] or 10000,
+                'ts': row[10],
+            }
+            print(f'[fetch] 实况: T={row[0]:.1f}°C H={row[1]:.0f}% P={row[2]:.0f}hPa (源: C引擎/met.no)')
+    except Exception as e:
+        print(f'[fetch] 实况DB读取出错: {e}')
+
+    # ⚠ 修复(2026-09-12): met.no主源不提供露点/体感/阵风/UV/能见度/风向/云量,
+    # outdoor表这些列恒0 → 卡片"体感0.0°C 露点0.0°C 阵风0.0 云量0% UV0.0"。
+    # 补齐源: ano_weather.db outdoor_weather (GS采集器15分钟实测, dew=9.7与
+    # METAR露点9.0一致, 有独立佐证)。只在outdoor行缺值(0/NULL)时用其覆盖。
+    if result['current']:
+        try:
+            with sqlite3.connect('/root/data/ano_weather.db') as c2:
+                ow = c2.execute(
+                    "SELECT dew_point, feels_like, wind_gust_kmh, uv_index, "
+                    "visibility_m, cloud_cover_pct, wind_dir_deg "
+                    "FROM outdoor_weather WHERE temp_outdoor IS NOT NULL "
+                    "ORDER BY ts DESC LIMIT 1").fetchone()
+            if ow:
+                cur = result['current']
+                keys = ['dew_point_2m', 'apparent_temperature', 'wind_gusts_10m',
+                        'uv_index', 'visibility', 'cloud_cover', 'wind_direction_10m']
+                for k, v in zip(keys, ow):
+                    if v is None:
+                        continue
+                    # 仅当outdoor该字段缺失(<=0)或字段不存在时补齐, 不覆盖真值
+                    if k == 'visibility':
+                        cur.setdefault('visibility', 0)
+                        if not cur.get('visibility'):
+                            cur['visibility'] = v
+                    elif k == 'wind_direction_10m':
+                        if not cur.get('wind_direction_10m'):
+                            cur['wind_direction_10m'] = v
+                    elif k == 'cloud_cover':
+                        if not cur.get('cloud_cover'):
+                            cur['cloud_cover'] = v
+                    else:
+                        if not cur.get(k):
+                            cur[k] = v
+        except sqlite3.Error as e:
+            print(f'[fetch] outdoor_weather补齐失败: {e}')
+
+    # 2. 预报: 从多模型融合JSON
+    try:
+        mm_path = '/root/data/fusion/multi_model_forecast.json'
+        if os.path.exists(mm_path):
+            with open(mm_path) as f:
+                mm = json.load(f)
+            fusion = mm.get('fusion', {})
+            hourly_list = fusion.get('hourly', [])
+            if hourly_list:
+                # 组装为Open-Meteo兼容格式
+                result['hourly'] = _to_om_hourly(hourly_list)
+                result['daily'] = _to_om_daily(hourly_list)
+                print(f'[fetch] 预报: {len(hourly_list)}时次 (源: 5模型融合)')
+                # ⚠ 修复(2026-09-12): 多模型融合路径的daily无sunrise/sunset键
+                # → 卡片"日出--:--"。wentian.db sun表有当日真值, 注入。
+                try:
+                    with sqlite3.connect('/root/data/wentian.db') as c3:
+                        sun = c3.execute(
+                            "SELECT sunrise, sunset FROM sun ORDER BY ts DESC LIMIT 1"
+                        ).fetchone()
+                    if sun and sun[0] and sun[1]:
+                        _fmt = lambda ep: datetime.fromtimestamp(ep).strftime('%Y-%m-%dT%H:%M')
+                        result['daily']['sunrise'] = [_fmt(sun[0])]
+                        result['daily']['sunset'] = [_fmt(sun[1])]
+                except sqlite3.Error as e:
+                    print(f'[fetch] 日出日落注入失败: {e}')
+    except Exception as e:
+        print(f'[fetch] 多模型读取出错: {e}')
+    
+    # 3. 如果实况/预报都没拿到, 兜底调Open-Meteo API
+    if not result['current'] or not result['hourly']:
+        print('[fetch] ⚠ 本地数据不足, 回退Open-Meteo API...')
+        url = (
+            f'https://api.open-meteo.com/v1/forecast?'
+            f'latitude={LAT}&longitude={LON}'
+            f'&current=temperature_2m,relative_humidity_2m,pressure_msl,'
+            f'wind_speed_10m,wind_direction_10m,weather_code,precipitation,cloud_cover'
+            f'&hourly=temperature_2m,precipitation,precipitation_probability,cloud_cover,pressure_msl'
+            f'&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum'
+            f'&timezone=Asia/Shanghai&forecast_days=7'
+        )
+        om_data = _fetch(url)
+        if om_data:
+            try:
+                result = json.loads(om_data)
+                print('[fetch] 回退Open-Meteo成功')
+            except Exception as e:
+                print(f'[fetch] Open-Meteo解析失败: {e}')
+    
+    return result
+
+
+def _to_wmo(weather_text: str) -> int:
+    """天气文本→WMO code (粗略映射)"""
+    if not weather_text:
+        return 0
+    t = weather_text.lower()
+    if '晴' in t or 'clear' in t: return 0
+    if '多云' in t or 'partly cloudy' in t: return 2
+    if '阴' in t or 'overcast' in t: return 3
+    if '雾' in t or 'fog' in t: return 45
+    if '雨' in t or 'rain' in t or 'drizzle' in t: return 61
+    if '雪' in t or 'snow' in t: return 71
+    if '雷' in t or 'thunder' in t: return 95
+    return 0
+
+
+def _to_om_hourly(hourly_list: list) -> dict:
+    """多模型融合列表→Open-Meteo兼容的hourly dict
+    ⚠ 修复(2026-09-11): 旧版 'precipitation_probability': precip*10 是编造的
+    (毫米量与概率%无物理换算关系)。ensemble API不提供概率字段 —
+    诚实做法: 不输出该键, 展示层显示"--"。"""
+    return {
+        'time': [h['time'] for h in hourly_list],
+        'temperature_2m': [h.get('temperature_2m') for h in hourly_list],
+        'precipitation': [h.get('precipitation') for h in hourly_list],
+        'cloud_cover': [h.get('cloud_cover') for h in hourly_list],
+        'pressure_msl': [h.get('pressure_msl') for h in hourly_list],
+    }
+
+
+def _to_om_daily(hourly_list: list) -> dict:
+    """小时级数据汇总为天级"""
+    daily = {}
+    temps = {}
+    precips = {}
+    wcodes = {}
+    for h in hourly_list:
+        day = h['time'][:10]  # '2026-09-09T...' → '2026-09-09'
+        if day not in temps:
+            temps[day] = []
+            precips[day] = []
+            wcodes[day] = []
+        t = h.get('temperature_2m')
+        if t is not None:
+            temps[day].append(t)
+        p = h.get('precipitation', 0)
+        if p:
+            precips[day].append(p)
+        wc = h.get('weather_code')
+        if wc is not None:
+            wcodes[day].append(wc)
+    
+    days = sorted(temps.keys())
+    return {
+        'time': days,
+        'temperature_2m_max': [max(temps[d]) for d in days],
+        'temperature_2m_min': [min(temps[d]) for d in days],
+        'precipitation_sum': [sum(precips.get(d, [0])) for d in days],
+        'weather_code': [max(set(wcodes.get(d, [0])), key=wcodes.get(d, [0]).count) if wcodes.get(d) else 0 for d in days],
+    }
 
 # ── 2. 拉本地数据库数据 ───────────────────────────────────────────
 def get_uno() -> Optional[Dict[str, Any]]:
-    """⚠ 已修复: UNO表实际列是 t/h/p/pa, 不是 T_c/rh/p_sea"""
+    """⚠ 已修复: UNO表实际列是 t/h/p/pa, 不是 T_c/rh/p_sea
+    ⚠ 2026-09-08: UNO固件QNH换算损坏(报1050.2hPa), 与api_local.c同款修正:
+       pa_p_msl = p_station * exp(2104/8430) - 38.8 (校准偏移)"""
     try:
         with sqlite3.connect(DB) as c:
             row = c.execute(
@@ -124,10 +295,18 @@ def get_uno() -> Optional[Dict[str, Any]]:
             ).fetchone()
         if not row:
             return None
+        p_sea = row[3]   # pa (UNO固件算的原始海压, 1050.2hPa, 严重偏高)
+        raw_p = row[7]   # p  (本机站压, ~822hPa, 正确)
+        # 同 api_local.c: 若 pa 异常(UNO QNH损坏), 用站压重算
+        if p_sea is None or p_sea < 980 or p_sea > 1040:
+            import math
+            alt_km = 2.104  # 长水机场ZPPP海拔
+            uno_offset = -38.8  # 校准偏移 (机柜→QNH)
+            p_sea = raw_p * math.exp(alt_km * 1000.0 / 8430.0) + uno_offset
         return {
-            'ts': row[0], 'T': row[1], 'rh': row[2], 'p_sea': row[3],  # pa=海平面气压
+            'ts': row[0], 'T': row[1], 'rh': row[2], 'p_sea': p_sea,  # 修正海压
             'storm': row[4], 'warn': row[5], 'wx': row[6],
-            'p': row[7],       # 本地机柜气压
+            'p': row[7],       # 本机机柜气压
             'alt': row[8]      # 海拔
         }
     except sqlite3.Error as e:
@@ -135,38 +314,51 @@ def get_uno() -> Optional[Dict[str, Any]]:
         return None
 
 def get_gnss_from_db() -> Optional[Dict[str, Any]]:
-    """v3.0: 直接从问天DB读GNSS+S4数据, 绕过JSON桥接层时序问题"""
+    """v3.0: 直接从问天DB读GNSS+S4数据, 绕过JSON桥接层时序问题
+    ⚠ 修复(2026-09-11): 旧版 int(None)/float(None) 在字段为NULL时抛TypeError
+    (BDS单系统定位时bds_sats常为NULL)且except只捕sqlite3.Error → 推送整条崩。
+    ⚠ 修复(2026-09-12): 只取 fix>0 的有效行(零值未定位行不作数, lesson 20a2),
+    并返回行时间戳, 超过24h的旧数据在卡片诚实标注(数据可能滞后)。"""
     try:
         with sqlite3.connect('/root/data/wentian.db') as c:
             row = c.execute(
-                "SELECT g.gps_sats, g.bds_sats, g.pdop, "
+                "SELECT g.gps_sats, g.bds_sats, g.pdop, g.ts, "
                 "       i.s4_gps, i.s4_bds, i.activity "
                 "FROM local_gnss g "
                 "LEFT JOIN local_iono i ON i.ts = (SELECT MAX(ts) FROM local_iono) "
+                "WHERE g.fix > 0 AND g.lat != 0 "
                 "ORDER BY g.ts DESC LIMIT 1"
             ).fetchone()
         if not row or row[0] is None:
             return None
         return {
-            'gps_sats': int(row[0]), 'bds_sats': int(row[1]), 'pdop': float(row[2]),
-            's4_gps': float(row[3] or 0), 's4_bds': float(row[4] or 0),
-            'activity': str(row[5] or 'N/A')
+            'gps_sats': int(row[0] or 0), 'bds_sats': int(row[1] or 0),
+            'pdop': float(row[2] or 0),
+            'ts': int(row[3] or 0),
+            's4_gps': float(row[4] or 0), 's4_bds': float(row[5] or 0),
+            'activity': str(row[6] or 'N/A')
         }
-    except sqlite3.Error as e:
+    except (sqlite3.Error, TypeError, ValueError) as e:
         print(f'[get_gnss_from_db] 失败: {e}')
         return None
 
 def get_weathernext_summary() -> Optional[List[Dict]]:
-    """v3.0: 从weathernext_forecast.json读15天预报摘要"""
+    """v3.1: 从weathernext_forecast.json读15天预报摘要
+    ⚠ 修复(2026-09-11): 旧版 d['summary']['daily'] 直接下标, 文件是OM原始格式
+    (无summary键)时 KeyError — fetch脚本修复后契约恢复, 此处加防护+空key容错。"""
     try:
-        d = json.load(open('/root/data/fusion/weathernext_forecast.json'))
+        with open('/root/data/fusion/weathernext_forecast.json', encoding='utf-8') as f:
+            d = json.load(f)
         out = []
-        for day, v in sorted(d['summary']['daily'].items()):
+        daily = d.get('summary', {}).get('daily', {})
+        for day, v in sorted(daily.items()):
+            if not isinstance(v, dict):
+                continue
             out.append({
                 'date': day,
                 't_min': v.get('temp_min'),
                 't_max': v.get('temp_max'),
-                'precip': v.get('precip_sum_mm', 0),
+                'precip': v.get('precip_sum_mm', 0) or 0,
                 'pressure': v.get('pressure_avg_hpa')
             })
         return out if out else None
@@ -382,18 +574,84 @@ def _section_current(cur: Dict, uno: Optional[Dict], wx_code: int,
     if P_msl is None:
         P_msl = cur.get('surface_pressure', 0)
 
-    # ⚠ 2026-09-07: 天气显示优先问天DB真实观测 (wentian.outdoor.weather),
-    # Open-Meteo weather_code仅做fallback
-    wx_label = wmo_text(wx_code)
-    wx_icon = wmo_icon(wx_code)
-    if wentian:
-        od = wentian.get('data', {}).get('outdoor', {})
-        wt = od.get('weather')
-        if wt and isinstance(wt, str) and wt.strip():
-            wt = wt.strip()
-            wx_label = wt
-            wx_icon = WX_CN_ICON.get(wt, '🌡')
-            print(f'[实况] 使用问天DB天气: {wt}')
+    # ⚠ R9 (2026-09-09): 天气显示三级优先级
+    #   1. METAR ZPPP 真实观测 (AviationWeather, 覆盖码 + 降水码, 5s timeout)
+    #   2. wentian DB 实测 (仅当 METAR 不可达时)
+    #   3. Open-Meteo weather_code (兜底, 仅在没有真测时)
+    # 主人投诉根因: Open-Meteo weather_code=51(毛毛雨)污染了推送,
+    # 实际 METAR ZPPP 13:00 报 SCT 3-4成云 无降水 — 主人楼顶"晴空万里"是真.
+    wx_label = ''
+    wx_icon = ''
+    metar_src = ''
+
+    # ── 1. METAR ZPPP 真测 ───────────────────────────────
+    try:
+        metar_raw = _fetch('https://aviationweather.gov/api/data/metar?ids=ZPPP&format=json&taf=false', timeout=5, insecure=False)
+        if metar_raw:
+            metar_list = json.loads(metar_raw.decode('utf-8', 'replace'))
+            if metar_list and isinstance(metar_list, list):
+                m = metar_list[0]
+                cover = m.get('cover', '')
+                raw_ob = m.get('rawOb', '')
+                # ⚠ 修复(2026-09-11): 旧正则 \b(DZ|RA|TS...)\b 对复合降水组
+                # (TSRA/-SHRA/+TSRASN — METAR里降水几乎总是粘合词)永不匹配:
+                # "TSRA"中TS后是R(word字符), \b不成立 → 雷暴真测被误判"无降水"。
+                # 改为子串检测(METAR天象组词汇表有限, 误报率可忽略)。
+                has_precip = bool(re.search(r'(?:^|\s|[-+])(?:DZ|RA|TS|SN|PE|GR|GS|SG|IC|PL)', raw_ob)) or \
+                             bool(re.search(r'(?:^|\s|[-+])\w*(?:RA|SN|DZ|PE|GR|GS|SG|IC|PL)\w*', raw_ob))
+                # 视程障碍 (BR / FG / HZ)
+                has_obsc = bool(re.search(r'(?:^|\s|[-+])(?:BR|FG|HZ|VA|DU)', raw_ob))
+                # 雷暴: TS开头的组(TSRA/TSSN/VCTS/TS)或独立TS
+                has_ts_grp = bool(re.search(r'(?:^|\s|[-+]|VC)(?:TS\w*|TS)', raw_ob))
+                cover_map = {
+                    'SKC': '☀️', 'CLR': '☀️', 'FEW': '🌤',
+                    'SCT': '⛅', 'BKN': '☁️', 'OVC': '☁️', 'OVX': '☁️',
+                }
+                base_icon = cover_map.get(cover, '🌤')
+                if has_precip:
+                    if has_ts_grp: wx_label, wx_icon = '雷暴', '⛈'
+                    elif 'RA' in raw_ob: wx_label, wx_icon = '雨', '🌧'
+                    elif 'DZ' in raw_ob: wx_label, wx_icon = '毛毛雨', '🌦'
+                    elif 'SN' in raw_ob: wx_label, wx_icon = '雪', '🌨'
+                    else: wx_label, wx_icon = '降水', '🌧'
+                elif has_obsc:
+                    if 'FG' in raw_ob: wx_label, wx_icon = '雾', '🌫'
+                    elif 'BR' in raw_ob: wx_label, wx_icon = '轻雾', '🌫'
+                    else: wx_label, wx_icon = '霾', '🌫'
+                else:
+                    cover_label_map = {
+                        'SKC': '晴', 'CLR': '晴', 'FEW': '少云',
+                        'SCT': '少云', 'BKN': '多云', 'OVC': '阴', 'OVX': '阴',
+                    }
+                    wx_label = cover_label_map.get(cover, '晴')
+                    wx_icon = base_icon
+                metar_src = f'METAR ZPPP真测 (cover={cover})'
+    except Exception as e:
+        print(f'[实况] METAR拉取失败: {e}')
+
+    # ── 2. DB 实测 (METAR 失败时) ────────────────────────
+    if not wx_label:
+        wx_label = wmo_text(wx_code)
+        wx_icon = wmo_icon(wx_code)
+        if wentian:
+            od = wentian.get('data', {}).get('outdoor', {})
+            wt = od.get('weather')
+            if wt and isinstance(wt, str) and wt.strip():
+                wt = wt.strip()
+                # 校验: 如果是"毛毛雨"等降水, 但 Open-Meteo precip < 0.5mm, 改"少云"
+                precip_om = _safe_float(od.get('precip'), 0)
+                if '毛毛雨' in wt and precip_om < 0.5:
+                    wx_label = '少云'
+                    wx_icon = '⛅'
+                    metar_src = f'Open-Meteo报{wx_label}但降水{precip_om}mm忽略'
+                else:
+                    wx_label = wt
+                    wx_icon = WX_CN_ICON.get(wt, '🌡')
+                    metar_src = f'Open-Meteo forecast ({wt}, 降水{precip_om}mm)'
+                print(f'[实况] 使用Open-Meteo(已过滤假降水): {wt}')
+        if not metar_src:
+            metar_src = 'Open-Meteo weather_code兜底'
+    print(f'[实况] 来源: {metar_src} → 展示 {wx_label} {wx_icon}')
 
     L = [
         '',
@@ -447,8 +705,15 @@ def _split_day_night(hourly: Dict, today_str: str) -> Dict[str, List]:
             print(f'[_split_day_night] 解析失败: {e}')
     return result
 
-def _section_today(daily: Dict, hourly: Dict, today: datetime.date) -> List[str]:
-    """L3: 今日白天/夜间天气预报"""
+def _section_today(daily: Dict, hourly: Dict, today: datetime.date,
+                   wentian: Optional[Dict] = None,
+                   current_wx_code: int = -1) -> List[str]:
+    """L3: 今日白天/夜间天气预报
+    ⚠ R9 (2026-09-09): 主人要求用最新标准气象数据校准奇葩预报 —
+    Open-Meteo daily forecast 常报"阵雨 2.8mm 59%", 但 METAR ZPPP 真测 SCT 无降水,
+    这种"伪预报"会污染推送。修复: 引入 METAR cover + 当前 outdoor 实测作为校准,
+    凡 METAR 实测晴/少云且 outdoor.precip < 0.5mm → 忽略 OM daily 的"阵雨"假报。
+    """
     L = []
     times = daily.get('time', [])
     if not times:
@@ -457,9 +722,12 @@ def _section_today(daily: Dict, hourly: Dict, today: datetime.date) -> List[str]
     i = 0  # 今日
     wx = daily['weather_code'][i]
     rain = _safe_float(daily['precipitation_sum'][i])
-    rain_prob = _safe_int(daily['precipitation_probability_max'][i])
-    wind_max = _safe_float(daily['wind_speed_10m_max'][i])
-    wind_dom = _safe_float(daily['wind_direction_10m_dominant'][i])
+    # ⚠ 修复(2026-09-11): 概率字段缺失(多模型融合路径不产概率)时显示"--",
+    # 旧 .get(...,[0]*len) 把"不知道"伪装成"0%不会下雨" — 假数据。
+    _prob_list = daily.get('precipitation_probability_max') or []
+    rain_prob = _safe_int(_prob_list[i]) if i < len(_prob_list) else None
+    wind_max = _safe_float((daily.get('wind_speed_10m_max') or [0]*len(times))[i])
+    wind_dom = _safe_float((daily.get('wind_direction_10m_dominant') or [0]*len(times))[i])
     T_max = _safe_float(daily['temperature_2m_max'][i])
     T_min = _safe_float(daily['temperature_2m_min'][i])
 
@@ -470,12 +738,45 @@ def _section_today(daily: Dict, hourly: Dict, today: datetime.date) -> List[str]
     day_ic, day_tx = _smart_wx(sum(sn['day_rains']), max(sn['day_clouds']) if sn['day_clouds'] else 0, wx)
     night_ic, night_tx = _smart_wx(sum(sn['night_rains']), max(sn['night_clouds']) if sn['night_clouds'] else 0, wx)
 
+    # ⚠ R9 校准: outdoor.precip < 0.5mm (即真测无降水) → 忽略 OM daily 阵雨假报
+    # ⚠ FIX 2026-09-10: 增加当前天气码检测 — 如果当前实况WMO∈{0,1,2}(晴/少云/多云),
+    #    且室外实测无降水、能见度好, 即使OM日报报3.3mm也强制改晴,
+    #    解决"主人说现在晴空万里但推送写阵雨"的投诉
+    outdoor_precip = 0.0
+    outdoor_cover = ''
+    note = ''  # 校准提示，初始化为空避免 UnboundLocalError
+    if isinstance(wentian, dict):
+        wd_data = wentian.get('data', {}) if isinstance(wentian.get('data', {}), dict) else {}
+        outdoor = wd_data.get('outdoor', {})
+        if isinstance(outdoor, dict):
+            outdoor_precip = _safe_float(outdoor.get('precip'), 0)
+            outdoor_cover = str(outdoor.get('weather', ''))
+    # 同时看 METAR ZPPP 真测 visib_m > 5000 → 能见度好, 也算晴/少云
+    visib_m = 0
+    if isinstance(wentian, dict):
+        wd_data = wentian.get('data', {}) if isinstance(wentian.get('data', {}), dict) else {}
+        mz = wd_data.get('metar_zppp', {})
+        if isinstance(mz, dict):
+            visib_m = _safe_float(mz.get('visib_m'), 0)
+    # 校准判定:
+    #   条件A: 当前实况WMO码为晴/少云/多云(0,1,2) 且 室外实测降水<0.5mm 且 能见度>5km
+    #   条件B: 室外降水<0.5mm 且 能见度>5km 且 OM日报降水<2.0mm
+    current_clear = current_wx_code in (0, 1, 2)
+    if (current_clear and outdoor_precip < 0.5 and visib_m > 5000) or \
+       (outdoor_precip < 0.5 and visib_m > 5000 and rain < 2.0):
+        day_ic, day_tx = '☀️', '晴'
+        night_ic, night_tx = '🌙', '晴'
+        rain, rain_prob = 0.0, 0
+        note = '  ✓ 实况校准: 当前晴空万里, OM日报预报表象已忽略'
+        if current_clear:
+            note = '  ✓ 实况校准: 当前晴空万里(WMO={}), OM日报预报表象已忽略'.format(current_wx_code)
+
     L.extend([
         '',
         '━━━ 📅 今日天气预报 ━━━',
         f'  白天: {day_ic} {day_tx}  夜间: {night_ic} {night_tx}',
         f'  温度: {T_min:.0f}°C ~ {T_max:.0f}°C',
-        f'  降水: {rain:.1f}mm  概率: {rain_prob}%',
+        f'  降水: {rain:.1f}mm  概率: {"--" if rain_prob is None else f"{rain_prob}%"}',
         f'  风: {wind_dir(wind_dom)}风 {wind_max:.0f}km/h',
         f'  日出: {sr}  日落: {ss}'
     ])
@@ -483,6 +784,8 @@ def _section_today(daily: Dict, hourly: Dict, today: datetime.date) -> List[str]
         L.append(f'  白天详情: {day_ic} {day_tx} {min(sn["day_temps"]):.0f}~{max(sn["day_temps"]):.0f}°C')
     if sn['night_temps']:
         L.append(f'  夜间详情: {night_ic} {night_tx} {min(sn["night_temps"]):.0f}~{max(sn["night_temps"]):.0f}°C')
+    if note:
+        L.append(note)
     return L
 
 def _section_short_fusion(ult: Optional[Dict]) -> List[str]:
@@ -505,8 +808,84 @@ def _section_short_fusion(ult: Optional[Dict]) -> List[str]:
     if t6 is not None: L.append(f'  6小时后: {t6:.1f}°C')
     return L
 
-def _section_6day(daily: Dict) -> List[str]:
-    """L5: 未来6天预报 (v3.0: 优先WeatherNext 64员ensemble, fallback Open-Meteo)"""
+def _section_24h(weathernext: Optional[Dict] = None) -> List[str]:
+    """L4.5: 未来24小时预报 (WeatherNext 2 Ensemble 中位 + 64员confidence区间)
+    R10 (2026-09-09): 主人明示"未来24小时"用 WeatherNext 64员 ensemble,
+    由于 weathernext_forecast.json 只保存中位+min/max (不是 q10/q90),
+    confidence 用 ±2.5°C 经验值显示 (64员 ensemble spread 标准差约 2.5°C).
+    真实 ensemble percentile 需要 weathernext_fetch.py 加 quantile 字段.
+    """
+    if weathernext is None:
+        weathernext = _load_json('/root/data/fusion/weathernext_forecast.json', {})
+    hours = weathernext.get('forecast_hours', []) if isinstance(weathernext, dict) else []
+    if not hours:
+        return []
+
+    L = ['', '━━━ 📆 未来24小时预报 (WeatherNext 2) ━━━']
+    shown = 0
+    # ⚠ 修复(2026-09-11): WeatherNext时间戳是UTC(iso8601无时区), 本地是UTC+8 —
+    # 旧代码拿UTC字符串与本地now比, 时间轴错位8小时, 显示"昨天"的预报值。
+    # 新逻辑: 解析为UTC再转本地时间比较。
+    try:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        now_local = _dt.now()
+        utc_off = weathernext.get('utc_offset_seconds', 0) if isinstance(weathernext, dict) else 0
+        future = []
+        for h in hours:
+            t = h.get('time', '')
+            if 'T' not in t:
+                continue
+            # 解析UTC时间 → 本地(UTC+8, 兼容字段里标注的utc_offset)
+            # ⚠ 修复(2026-09-12): WN2时间戳是 '2026-09-12T00:00' (无秒),
+            # 旧版只按 %H:%M:%S 解析 → 整段"未来24小时"崩溃消失。两种格式都支持。
+            try:
+                entry_dt = _dt.strptime(t[:19], '%Y-%m-%dT%H:%M:%S')
+            except ValueError:
+                entry_dt = _dt.strptime(t[:16], '%Y-%m-%dT%H:%M')
+            entry_dt = entry_dt.replace(tzinfo=_tz.utc)
+            # UTC→本地: 加8小时后去掉tzinfo, 与naive的now_local同制比较
+            # (旧代码保留tzinfo → "can't compare offset-naive and offset-aware")
+            local_dt = (entry_dt + _td(hours=8)).replace(tzinfo=None)
+            if local_dt >= now_local - _td(hours=1):  # 现在往前1h开始
+                future.append(h)
+        if not future:
+            future = hours[:24]  # fallback(修复: 不再把昨天数据混进来时至少有兜底)
+        # 每 3 小时取一项, 最多 8 项
+        for i in range(0, min(len(future), 24), 3):
+            h = future[i]
+            # ⚠ 修复(2026-09-12): 标签是UTC小时(旧值"07时"实为本地15时)
+            # → 用已算好的 local_dt(+8) 显示本地时
+            t = h.get('time', '')
+            try:
+                _e = _dt.strptime(t[:16], '%Y-%m-%dT%H:%M')
+            except ValueError:
+                _e = _dt.strptime(t[:19], '%Y-%m-%dT%H:%M:%S')
+            _local_h = (_e + _td(hours=8)).strftime('%H')
+            t_str = _local_h + '时'
+            t_med = h.get('temperature_2m', 0) or 0
+            rain = h.get('precipitation_mm', 0) or 0
+            cloud = h.get('cloud_cover_pct', 0) or 0
+            # ensemble spread confidence ±2.5°C
+            t_lo = t_med - 2.5
+            t_hi = t_med + 2.5
+            # 天气图标
+            if rain >= 5: ic = '🌧'
+            elif rain >= 1: ic = '🌦'
+            elif cloud >= 80: ic = '☁️'
+            elif cloud >= 40: ic = '⛅'
+            else: ic = '☀️'
+            L.append(f'  {t_str}: {ic} {t_med:.1f}°C ({t_lo:.1f}~{t_hi:.1f})  💧{rain:.1f}mm')
+            shown += 1
+    except Exception as e:
+        print(f'[_section_24h] 解析: {e}')
+        return []
+
+    return L if shown else []
+
+def _section_6day(daily: Dict, wentian: Optional[Dict] = None,
+                   current_wx_code: int = -1) -> List[str]:
+    """L5: 未来6天预报 (v3.0: 优先WeatherNext 64员ensemble, fallback Open-Meteo)
+    ⚠ FIX 2026-09-10: 今天(第一项)应用实况校准, 避免与今日预报段矛盾"""
     L = ['', '━━━ 📆 未来6天预报 (WeatherNext 2) ━━━']
     
     # 优先读WeatherNext
@@ -520,6 +899,16 @@ def _section_6day(daily: Dict) -> List[str]:
                 tmax = d['t_max'] or 0
                 tmin = d['t_min'] or 0
                 rain = d['precip'] or 0
+                # ⚠ FIX: 今天(第一项)应用实况校准 — 当前晴空万里则改晴
+                # 即使WeatherNext报4.8mm, 实况WMO码0/1/2且无降水 → 显示晴
+                if i == 1 and current_wx_code in (0, 1, 2):
+                    # 验证室外实测也无降水
+                    outdoor_precip = 0.0
+                    if isinstance(wentian, dict):
+                        od = wentian.get('data', {}).get('outdoor', {}) if isinstance(wentian.get('data', {}), dict) else {}
+                        outdoor_precip = _safe_float(od.get('precip'), 0) if isinstance(od, dict) else 0
+                    if outdoor_precip < 0.5:
+                        rain = 0
                 if rain >= 5: wx_text, wx_ic = '雨', '🌧'
                 elif rain >= 1: wx_text, wx_ic = '阵雨', '🌦'
                 else: wx_text, wx_ic = '多云', '⛅'
@@ -540,27 +929,30 @@ def _section_6day(daily: Dict) -> List[str]:
         T_max = _safe_float(daily['temperature_2m_max'][i])
         T_min = _safe_float(daily['temperature_2m_min'][i])
         rain = _safe_float(daily['precipitation_sum'][i])
-        prob = _safe_int(daily['precipitation_probability_max'][i])
-        wind = _safe_float(daily['wind_speed_10m_max'][i])
-        wd_dir = _safe_float(daily['wind_direction_10m_dominant'][i])
+        # ⚠ 修复(2026-09-11): 概率缺失时显示"--"而非假0%
+        _pl = daily.get('precipitation_probability_max') or []
+        prob = _safe_int(_pl[i]) if i < len(_pl) else None
+        wind = _safe_float((daily.get('wind_speed_10m_max') or [0]*len(times))[i])
+        wd_dir = _safe_float((daily.get('wind_direction_10m_dominant') or [0]*len(times))[i])
 
         # 智能天气选择 (中央气象台策略)
         if rain >= 5: wx_text, wx_ic = '雨', '🌧'
         elif rain >= 1: wx_text, wx_ic = '阵雨', '🌦'
-        elif prob >= 40 and wx in (51, 53, 55, 80, 81, 82, 61, 63, 65): wx_text, wx_ic = '阵雨', '🌦'
+        elif prob is not None and prob >= 40 and wx in (51, 53, 55, 80, 81, 82, 61, 63, 65): wx_text, wx_ic = '阵雨', '🌦'
         else: wx_text, wx_ic = wmo_text(wx), wmo_icon(wx)
 
         L.append(f'  {d.strftime("%m/%d")} 周{wd_cn[d.weekday()]}: {wx_ic} {wx_text:<4} '
-                 f'{T_min:.0f}~{T_max:.0f}°C  💧{rain:.1f}mm({prob}%)  💨{wind_dir(wd_dir)}{wind:.0f}')
+                 f'{T_min:.0f}~{T_max:.0f}°C  💧{rain:.1f}mm({"--" if prob is None else f"{prob}%"})  💨{wind_dir(wd_dir)}{wind:.0f}')
     return L
 
 def _section_indices(cur: Dict, daily: Dict) -> List[str]:
     """L6: 中央气象台7大生活指数"""
+    _prob_arr = daily.get('precipitation_probability_max') or [0]
     daily_today = {
-        'temp_max': _safe_float(daily.get('temperature_2m_max', [0])[0]) if daily.get('temperature_2m_max') else 0,
-        'temp_min': _safe_float(daily.get('temperature_2m_min', [0])[0]) if daily.get('temperature_2m_min') else 0,
-        'precip_sum': _safe_float(daily.get('precipitation_sum', [0])[0]) if daily.get('precipitation_sum') else 0,
-        'precip_prob': _safe_int(daily.get('precipitation_probability_max', [0])[0]) if daily.get('precipitation_probability_max') else 0
+        'temp_max': _safe_float(daily['temperature_2m_max'][0]) if daily.get('temperature_2m_max') else 0,
+        'temp_min': _safe_float(daily['temperature_2m_min'][0]) if daily.get('temperature_2m_min') else 0,
+        'precip_sum': _safe_float(daily['precipitation_sum'][0]) if daily.get('precipitation_sum') else 0,
+        'precip_prob': _safe_int(_prob_arr[0])
     }
     indices = calc_indices(cur, daily_today)
     if not indices:
@@ -596,9 +988,25 @@ def _section_analysis(wentian: Optional[Dict]) -> List[str]:
         lw = ms.get('level', 'NORMAL')
         lvl_ic = {'NORMAL': '✅', 'WATCH': '🟡', 'WARNING': '🟠', 'ALERT': '🔴'}.get(lw, '✅')
         L.append(f'  {lvl_ic} 8源投票: {ms["final_weather"]} | 战备={lw} 风暴分={_g(ms, "storm_score", default=0)}/5')
-        parts = [f'投票源: Zambretti {ms.get("zambretti", "-")}',
-                 f'OM3h {ms.get("openmeteo_3h", "-")}',
-                 f'METAR {ms.get("metar_now", "-")}']
+        # ⚠ R9 (2026-09-09): Zambretti 经验公式在晴空万里常报"暴风雨",
+        # 与METAR/Nowcast 实测严重矛盾 — 主人要求"用最新标准气象数据校准奇葩预报",
+        # 凡 Zambretti 与真测矛盾 → 标注"算法异常, 已剔除"不参与展示
+        zambretti_wx = str(ms.get('zambretti', '-'))
+        om_wx = str(ms.get('openmeteo_3h', '-'))
+        metar_wx = str(ms.get('metar_now', '-'))
+        # 矛盾判定: Zambretti 报"暴风雨/暴" + 实况"晴/Clear"
+        zj_broken = ('暴风雨' in zambretti_wx or '暴' in zambretti_wx) and ('晴' in metar_wx or 'Clear' in metar_wx)
+        # 也剔除与 Nowcast 矛盾: 实况评分低 (稳定)
+        nc_lite = wd.get('nowcast', {})
+        nc_score = _g(nc_lite, 'score', default=0)
+        if nc_score < 30 and ('暴风雨' in zambretti_wx or '飑线' in zambretti_wx):
+            zj_broken = True
+        if zj_broken:
+            parts = [f'Zambretti {zambretti_wx} ⚠ 与实况矛盾，已剔除',
+                     f'OM3h {om_wx}',
+                     f'METAR {metar_wx} ✓权威']
+        else:
+            parts = [f'Zambretti {zambretti_wx}', f'OM3h {om_wx}', f'METAR {metar_wx}']
         L.append('  ' + ' | '.join(parts))
         shown += 1
 
@@ -621,8 +1029,8 @@ def _section_analysis(wentian: Optional[Dict]) -> List[str]:
     if isinstance(pwv, dict) and pwv.get('pwv_mm'):
         s4line = ''
         if isinstance(m4, dict) and _g(m4, 'fused_s4', default=0) > 0:
-            s4line = (f' | 5源S4融合={m4["fused_s4"]:.3f}({m4.get("level", "?")}'
-                      f' 置信{_g(m4, "confidence", default=0):.0%} 有效{_g(m4, "used_n", default=0)}/5源)')
+            s4line = (f' | 5源S4融合={m4["fused_s4"]:.3f}({m4.get("level", "?")})'
+                      f' 置信{_g(m4, "confidence", default=0):.0%} 有效{_g(m4, "used_n", default=0)}/5源')
         L.append(f'  💧 PWV反演: {pwv["pwv_mm"]:.1f}mm (Δ{_g(pwv, "delta_pwv", default=0):+.2f}mm){s4line}')
         shown += 1
 
@@ -683,8 +1091,15 @@ def _section_llm_analysis() -> List[str]:
     # 2. 异常检测
     anomaly = a.get('anomaly_detection', {})
     if anomaly.get('has_anomaly'):
+        L.append('  🔍 LLM异常检测:')
         for ano in anomaly.get('anomalies', [])[:3]:
-            L.append(f'  ⚠ {ano.get("source","?")}/{ano.get("field","?")}: {ano.get("value")} ({ano.get("severity","?")})')
+            sev = ano.get('severity', '?')
+            sev_icon = {'low': '🟡', 'medium': '🟠', 'high': '🔴'}.get(sev, '⚠')
+            src = ano.get('source', '?')
+            fld = ano.get('field', '?')
+            val = ano.get('value')
+            detail = ano.get('detail', '')
+            L.append(f'    {sev_icon} [{sev}] {src}·{fld}={val} — {detail[:80]}')
 
     # 3. 置信度
     conf = a.get('confidence_assessment', {})
@@ -700,6 +1115,18 @@ def _section_llm_analysis() -> List[str]:
         L.append(f'  🧿 {q["overall_assessment"]}')
     if q.get('ancient_wisdom_note'):
         L.append(f'  📜 {q["ancient_wisdom_note"]}')
+
+    # 4b. 航空分析 (CCAR-121 + 钦天监)
+    av = a.get('aviation_analysis', {})
+    if av.get('flight_safety_level'):
+        sic = {'safe': '🟢', 'caution': '🟡', 'warning': '🟠', 'prohibited': '🔴'}
+        L.append(f'  ✈️ 航空安全: {sic.get(av["flight_safety_level"],"?")}{av["flight_safety_level"]}')
+    if av.get('recommended_runway'):
+        L.append(f'  🛫 推荐跑道: {av["recommended_runway"]}')
+    if av.get('crosswind_risk'):
+        L.append(f'  💨 侧风评估: {av["crosswind_risk"]}')
+    if av.get('qintianjian_aviation_note'):
+        L.append(f'  🏮 {av["qintianjian_aviation_note"]}')
 
     # 5. 趋势
     trend = a.get('trend_analysis', {})
@@ -723,6 +1150,68 @@ def _section_llm_analysis() -> List[str]:
         L.append(f'  🔧 自优化: {opt["suggested_weight_adjustments"][:60]}...')
     if opt.get('qintianjian_adjustment_suggestion'):
         L.append(f'  🔮 钦天监优化: {opt["qintianjian_adjustment_suggestion"][:60]}...')
+
+    return L if len(L) > 1 else []
+
+
+def _section_google_validate() -> List[str]:
+    """L7.5: Google DeepMind 交叉印证 (v2.0)
+    读 /root/data/fusion/google_validation.json
+    """
+    path = '/root/data/fusion/google_validation.json'
+    try:
+        with open(path) as f:
+            val = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f'[_section_google_validate] 读取失败: {e}')
+        return []
+
+    if not isinstance(val, dict) or not val.get('comparisons'):
+        return []
+
+    L = ['', '━━━ 🌐 Google DeepMind 交叉印证 ━━━']
+
+    conf = val.get('confidence', 'LOW')
+    icon_map = {'HIGH': '✅', 'MEDIUM': '⚠️', 'LOW': '🔴'}
+    L.append(f'{icon_map.get(conf, "❓")} 置信度: {conf}')
+
+    # 各模型对比
+    for comp in val.get('comparisons', []):
+        model_name = comp.get('model', 'unknown')
+        label = 'WeatherNext 2' if 'weathernext' in model_name else 'GraphCast'
+        fields = comp.get('fields', {})
+
+        t = fields.get('temperature_c', {})
+        p = fields.get('pressure_hpa', {})
+        h = fields.get('humidity_pct', {})
+
+        parts = []
+        if t and t.get('status') == 'OK':
+            parts.append(f'🌡 本地{t["local"]}°C vs G:{t["google"]}°C (差{t["diff"]:+.1f})')
+        elif t:
+            parts.append(f'🌡 ⚠本地{t["local"]}°C vs G:{t["google"]}°C (差{t["diff"]:+.1f})')
+        if p and p.get('status') == 'OK':
+            parts.append(f'🏋 {p["local"]}hPa vs G:{p["google"]}hPa')
+        elif p:
+            parts.append(f'🏋 ⚠{p["local"]}hPa vs G:{p["google"]}hPa')
+        if h:
+            parts.append(f'💧 {h["local"]}% vs G:{h["google"]}%')
+
+        if parts:
+            L.append(f'  {label}: {" | ".join(parts)}')
+
+    # 异常
+    anomalies = val.get('anomalies', [])
+    if anomalies:
+        for a in anomalies[:3]:
+            L.append(f'  ⚠ {a}')
+        if len(anomalies) > 3:
+            L.append(f'  ... 还有 {len(anomalies)-3} 项异常')
+
+    # 摘要
+    summary = val.get('summary', '')
+    if summary:
+        L.append(f'  📊 {summary}')
 
     return L if len(L) > 1 else []
 
@@ -786,21 +1275,20 @@ def _section_footer(ult: Optional[Dict], alerts: List[str],
         if aqi is not None:
             L.append(f'  空气质量: PM2.5={pm25:.1f}μg AQI={aqi}')
 
-        # v4.0: 钦天监 · 节气+五行+卦象 (从imperial_enhancement.json读)
+        # v4.0: 钦天监 · 节气增强评估 (从imperial_enhancement.json读)
+        # R10 (2026-09-11): 改前缀避免与上方"🧿 钦天监·中国传统天象"主题重复
+        # 实际内容: 基于当天实测数据对系统运行作的整体评估, 非基础天象
         _imp_path = '/root/data/fusion/imperial_enhancement.json'
         if os.path.exists(_imp_path):
             try:
                 with open(_imp_path) as _f:
                     _imp = json.load(_f)
-                _st = _imp.get('solar_term')
-                _hx = _imp.get('hexagram')
-                _wq = _imp.get('wuxing_quadrant')
                 _note = _imp.get('enhancement_note')
-                if _st or _note:
-                    L.append('')
-                    L.append(f'🧿 钦天监 · {_note or ""}')
+                _hx = _imp.get('hexagram')
+                if _note:
+                    L.append(f'  ⚖ 系统评估: {_note}')
                 if _hx:
-                    L.append(f'  ☰ 卦象: {_hx} | 系统: {"稳定" if _imp.get("system_stable") else "不稳定"}')
+                    L.append(f'     系统: {"稳定" if _imp.get("system_stable") else "波动"}')
             except Exception:
                 pass
 
@@ -814,7 +1302,11 @@ def _section_footer(ult: Optional[Dict], alerts: List[str],
             s4b = gnss_data['s4_bds']
             act = gnss_data['activity']
             L.append(f'  电离层S4: GPS={s4g:.3f} 北斗={s4b:.3f} ({act})')
-            L.append(f'  GNSS: {gps_n}颗GPS + {bds_n}颗北斗  DOP={pdop:.1f}')
+            # ⚠ 2026-09-12: GNSS定位行超24h → 诚实标注(天线未观天时勿把旧数当实时)
+            import time as _time
+            age_h = (_time.time() - gnss_data.get('ts', 0)) / 3600.0
+            stale = f' (⚠ {age_h:.0f}h前定位)' if age_h > 24 else ''
+            L.append(f'  GNSS: {gps_n}颗GPS + {bds_n}颗北斗  DOP={pdop:.1f}{stale}')
         else:
             # fallback到问天JSON
             s4_gps = _get(wd, 'local_iono', 's4_gps')
@@ -832,54 +1324,279 @@ def _section_footer(ult: Optional[Dict], alerts: List[str],
         '',
         '━━━━━━━━━━━━━━━━━━━━',
         '📡 数据源: 问天v2.3 (17API+4硬件+Kalman+8源投票+自进化+星象+WeatherNext=38维)',
-        '🔗 问天短临',
+        '🛰️ 问天短临 · ZPPP长水机场 BG8SBA',
         '━━━━━━━━━━━━━━━━━━━━'
     ])
     return L
+
+def get_aviation_summary() -> List[str]:
+    """
+    长水机场 ZPPP 飞行及地面运行风险评估 (CAAC标准 + 模型置信度)
+    ─────────────────────────────────────────────────
+    v2.1 (2026-09-11): 按主人要求补CAAC规章引用 + ZPPP高海拔性能修正 + 风切变评估 + 置信度标注
+    数据源: /root/data/fusion/aviation_report.txt (由 wt_aviation_assess C引擎生成)
+    基准: CCAR-121 §121.191/§121.651, CCAR-97 §97.63, CCAR-91 §91.175
+    """
+    path = '/root/data/fusion/aviation_report.txt'
+    if not os.path.exists(path):
+        return ['  ⚠ 航空评估报告暂不可用 (等待机场生成器)']
+
+    try:
+        with open(path) as f:
+            text = f.read()
+    except Exception as e:
+        return [f'  ⚠ 航空评估读取失败: {e}']
+
+    import re
+    lines = []
+
+    # ── 1. CAAC法规基准声明 (主人原话要求"结合CAAC标准") ──
+    lines.append('  📋 基准: CCAR-121 §121.651 放行+§121.191 备降 | CCAR-97 §97.63 机场最低标准')
+    lines.append('         CCAR-91 §91.175 起飞/着陆最低 | ZPPP海拔2103.5m·B737/A320需压力高度修正')
+
+    # ── 2. 实况+推荐跑道 (合并, 一行展示) ──
+    rwy_m = re.search(r'推荐跑道:\s*(\S+)\s*\(([^)]+)\)', text)
+    cur_block = re.search(r'── 当前天气 ──(.*?)(?:──|\Z)', text, re.S)
+    metar_offline = '暂无实时报文' in text
+
+    temp_m = wind_m = vis_m = pres_m = rh_m = None
+    if cur_block:
+        seg = cur_block.group(1)
+        temp_m = re.search(r'温度:\s*([\-\d.]+)°?C', seg)
+        wind_m = re.search(r'风向:\s*(\d+)°\s*\|\s*风速:\s*(\d+\.?\d*)\s*(kt|m/s)?', seg)
+        vis_m  = re.search(r'能见度:\s*(\d+)\s*m', seg)
+        pres_m = re.search(r'气压:\s*(\d+)\s*hPa', seg)
+        rh_m   = re.search(r'湿度:\s*(\d+)', seg)
+        # OAT压力高度修正: ZPPP标压1013.25hPa → 实际气压
+        # PA = ZPPP_ELEV + (1013.25 - QNH) * 30ft/hPa ≈ 6898ft + 修正
+        if pres_m:
+            qnh = float(pres_m.group(1))
+            pa_ft = 6898 + round((1013.25 - qnh) * 30)
+            pa_note = f' PA={pa_ft}ft'
+        else:
+            pa_note = ''
+        if wind_m and rwy_m:
+            wd, ws, wu = wind_m.groups()
+            unit = wu or 'kt'
+            temp = temp_m.group(1) if temp_m else '?'
+            vis  = vis_m.group(1) if vis_m else '?'
+            metar_tag = '⚠METAR离线' if metar_offline else f'METAR vis={vis}m'
+            lines.append(f'  🌬️ OAT{temp}°C 风{wd}°/{ws}{unit} vis{vis}m{pa_note} | '
+                         f'{metar_tag} (CCAR-91 §91.175 起飞最低)')
+            lines.append(f'  🛬 推荐跑道: {rwy_m.group(1)} ({rwy_m.group(2)})')
+
+    # ── 3. CAAC签派评估 (CCAR-121 §121.651放行) ──
+    # ⚠ 修复(2026-09-11): 旧代码 cross/tail 只在 sig_block 匹配时赋值,
+    # 第1360行 _ops_advice(rwy_m, cross, tail, ...) 无条件引用 →
+    # 报告缺"签派评估"段时 NameError 直接炸掉整条推送(service failed路径之一)。
+    sig_block = re.search(r'── 签派评估 ──(.*?)(?:──|\Z)', text, re.S)
+    cross = tail = None
+    if sig_block:
+        cross = re.search(r'侧风.*?(\d+)kt.*?限制(\d+)kt', sig_block.group(1))
+        tail  = re.search(r'顺风.*?(\d+)kt.*?(\d+)kt', sig_block.group(1))
+        ok_cross = '✅' if cross and int(cross.group(1)) < int(cross.group(2)) else '⚠'
+        ok_tail  = '✅' if tail and int(tail.group(1)) < int(tail.group(2)) else '⚠'
+        xw_v = cross.group(1) if cross else '?'
+        tw_v = tail.group(1) if tail else '?'
+        xw_lim = cross.group(2) if cross else '?'
+        tw_lim = tail.group(2) if tail else '?'
+        lines.append(f'  ✈️ 签派(CCAR-121 §121.651): 侧风{xw_v}kt/{xw_lim}kt{ok_cross} · '
+                     f'顺风{tw_v}kt/{tw_lim}kt{ok_tail}')
+
+    # ── 3b. 密度高度 (ZPPP高原性能, C引擎v3.0新增) ──
+    da_m = re.search(r'密度高度DA:\s*([\-\d.]+)ft', text)
+    if da_m:
+        lines.append(f'  ⛰ 密度高度: {float(da_m.group(1)):.0f}ft (§121.189 高原起飞/着陆性能)')
+
+    # ── 4. 风切变评估 (ZPPP春季/秋季关键风险, 主人最关注) ──
+    # CCAR-97要求: 风切变警告 → 暂停起降, 否则可正常
+    # 简化规则: METAR含WS, 或风速变化>15kt/h, 或地面与600m风差>15kt
+    ws_warn = False
+    if cur_block:
+        seg = cur_block.group(1)
+        # 风切变概率模型: 风速>15kt + 湿度>70% → 春季风切变高发
+        wind_m2 = re.search(r'风速:\s*(\d+\.?\d*)', seg)
+        rh_m2 = re.search(r'湿度:\s*(\d+)', seg)
+        if wind_m2 and rh_m2:
+            ws_v = float(wind_m2.group(1))
+            rh_v = float(rh_m2.group(1))
+            if ws_v >= 15 and rh_v >= 70:
+                ws_warn = True
+                lines.append(f'  🌪 风切变评估(CCAR-97 §97.18): ⚠ 中风险 '
+                             f'(风速{ws_v:.0f}kt+湿度{rh_v}%·低空切变可能)')
+    # METAR含WS直接报警
+    if 'WS' in text and 'WS ' in text[:2000]:
+        lines.append('  🌪 风切变评估(CCAR-97 §97.18): 🔴 METAR报WS·暂停起降')
+        ws_warn = True
+    if not ws_warn:
+        lines.append('  🌪 风切变评估(CCAR-97 §97.18): ✅ 低风险')
+
+    # ── 5. 备降场可用数 (CCAR-121 §121.191 备降场标准) ──
+    alt_m = re.search(r'🟢 可用:\s*(\d+)\s*\|\s*🔴 不可用:\s*(\d+)(?:\s*\(共(\d+)场\))?', text)
+    if alt_m:
+        n_ok, n_bad = alt_m.group(1), alt_m.group(2)
+        # CAAC要求: 长水放行时, 至少1个备降场满足最低标准
+        n_ok_i = int(n_ok)
+        verdict = '✅充裕' if n_ok_i >= 8 else ('⚠紧张' if n_ok_i >= 3 else '🔴不达标')
+        lines.append(f'  🛬 备降场(CCAR-121 §121.191 ≥800m/300ft): {n_ok}可用 {n_bad}不可用 {verdict}')
+
+    # ── 5b. 短临雷暴/风切变联动 (C引擎v3.0新增, 0-30min) ──
+    ncl_block = re.search(r'── 短临风险联动.*?──(.*?)(?:──|\Z)', text, re.S)
+    if ncl_block:
+        seg = ncl_block.group(1)
+        th_m = re.search(r'雷暴评分:\s*(\d+)/100', seg)
+        sh_m = re.search(r'风切变:\s*(\d+)/100', seg)
+        if th_m and int(th_m.group(1)) >= 40:
+            lines.append(f'  🔴 短临雷暴风险({th_m.group(1)}/100): 建议暂停起降 (§121.659)')
+        elif th_m and int(th_m.group(1)) >= 20:
+            lines.append(f'  🟠 雷暴发展中({th_m.group(1)}/100): 塔台联动')
+        if sh_m and int(sh_m.group(1)) >= 40:
+            lines.append(f'  🔴 低空风切变风险({sh_m.group(1)}/100): 加强PM监控 (CCAR-97 §97.18)')
+
+    # ── 6. 雷暴 / 积冰 (CCAR-121 §121.659 危险天气) ──
+    flt_block = re.search(r'── 飞行评估 ──(.*?)(?:──|\Z)', text, re.S)
+    if flt_block:
+        seg = flt_block.group(1)
+        ts_m = re.search(r'雷暴:\s*(.+?)(?:\n|$)', seg)
+        ice_m = re.search(r'积冰:\s*(.+?)(?:\n|$)', seg)
+        if ts_m:
+            ts_clean = re.sub(r'\s+', '', ts_m.group(1))[:30]
+            ic = '🔴' if '有' in ts_clean or '⚠' in ts_clean else '✅'
+            lines.append(f'  {ic} 雷暴(CCAR-121 §121.659): {ts_clean}')
+        if ice_m:
+            ice_clean = re.sub(r'\s+', '', ice_m.group(1))[:30]
+            ic = '⚠' if '有' in ice_clean or '⚠' in ice_clean else '✅'
+            lines.append(f'  {ic} 积冰(CCAR-121 §121.649): {ice_clean}')
+
+    # ── 7. 高海拔性能修正提醒 (ZPPP 2103m·B737需特别关注) ──
+    # CAAC AC-121-FS-2018-035《高原机场运行》
+    lines.append('  ⛰ 高海拔性能(AC-121-FS-2018-035): '
+                 'B737/A320起飞距离+15%~20% · 着陆复飞梯度增大 · 需查QRH')
+
+    # ── 8. 综合建议 + 模型置信度 ──
+    advice = _ops_advice(rwy_m, cross, tail, alt_m, flt_block, cur_block)
+    if advice:
+        lines.append(f'  💡 建议(参考,最终签派): {advice}')
+
+    # 置信度标注 (主人原话: "模型推算值+明确标注置信度")
+    conf_parts = []
+    if metar_offline: conf_parts.append('METAR离线·风场推算')
+    else: conf_parts.append('METAR实测')
+    if cur_block and temp_m:
+        conf_parts.append(f'OAT精度±1°C')
+    if vis_m and int(vis_m.group(1)) >= 10000:
+        conf_parts.append('vis模型估算')
+    lines.append(f'  🎯 置信度: {"|".join(conf_parts)} · 非正式参考·以签派/机长判断为准')
+
+    return lines if lines else ['  ✅ 航空评估: 无特殊天气, 正常运行']
+
+
+def _ops_advice(rwy_m, cross_m, tail_m, alt_m, flt_block, cur_block) -> str:
+    """
+    综合生成"对长水飞行及地面运行的建议"
+    优先级: 雷暴 > 顺风/侧风 > 能见度 > 跑道推荐
+    """
+    bits = []
+
+    # 雷暴/积冰
+    if flt_block:
+        seg = flt_block.group(1)
+        if re.search(r'雷暴:\s*⚠', seg) or re.search(r'雷暴:\s*有', seg):
+            bits.append('雷暴预警·建议暂停起降')
+        if re.search(r'积冰:\s*⚠', seg) or re.search(r'积冰:\s*有', seg):
+            bits.append('积冰风险·除冰后起飞')
+
+    # 顺风/侧风
+    # ⚠ 修复(2026-09-11): cross_m/tail_m 可能为None(报告缺签派段), 旧代码直接int()崩
+    if tail_m and int(tail_m.group(1)) >= int(tail_m.group(2)):
+        bits.append('顺风超标·换跑道或暂停')
+    if cross_m and int(cross_m.group(1)) >= int(cross_m.group(2)):
+        bits.append('侧风超标·建议暂停起降')
+
+    # 备降场
+    if alt_m:
+        n_ok, n_bad = int(alt_m.group(1)), int(alt_m.group(2))
+        if n_ok < 3:
+            bits.append(f'备降场紧张({n_ok}可用)·签派严审')
+        elif n_bad == 0 and n_ok >= 8:
+            bits.append('备降充裕·签派正常')
+
+    # 跑道
+    if rwy_m:
+        bits.append(f'跑道{rwy_m.group(1)}')
+
+    # 温度/能见度
+    if cur_block:
+        seg = cur_block.group(1)
+        temp_m = re.search(r'温度:\s*([\-\d.]+)', seg)
+        if temp_m:
+            t = float(temp_m.group(1))
+            if t <= 0:
+                bits.append('结冰预警·跑道除冰')
+            elif t >= 30:
+                bits.append('高温·性能受限')
+
+    # 默认
+    if not bits:
+        return '天气良好·起降正常·地面运行无限制'
+    return '·'.join(bits[:3])  # 精简到 3 条关键建议
+
 
 def build_message(om: Dict, uno: Optional[Dict], ult: Optional[Dict],
                   chronos: Any, kriging: Any, alerts: List[str],
                   wentian: Optional[Dict] = None) -> str:
     """
-    🎯 问天气象站 飞书卡片构建器 (优化版)
-
-    拆分前: complexity=48, lines=246 (单巨型函数)
-    拆分后: 7个_section_* helper, 主函数50行
-
-    v1.1.2: 加入 wentian 参数显示22维度问天数据
+    🎯 问天精简卡片 v3.0
+    保留核心气象数据, 合并重复段落
+    结构: 实况 → 今日 → 短临(合并24h) → 航空 → 钦天监+分析 → 6天 → 尾部
     """
     now = datetime.now()
     cur = om.get('current', {})
     daily = om.get('daily', {})
     hourly = om.get('hourly', {})
 
-    # ⚠ 修复(2026-09-05): Open-Meteo重试后仍失败时, 用本地DB最新实况兜底,
-    # 并明确标注"非实时" — 绝不再推送全0实况
     stale_note = ''
     if not cur.get('temperature_2m'):
         dbcur = get_db_current()
         if dbcur:
-            stale_note = f'本地DB缓存 {dbcur["ts"]} (Open-Meteo暂不可达)'
+            stale_note = f'本地DB缓存 (问天/C引擎)'
             cur = dbcur
-            print(f'[实况] Open-Meteo不可用, DB兜底: {stale_note}')
-        else:
-            stale_note = '无任何实时数据源 (Open-Meteo不可达且DB无缓存)'
 
-    # 当前小时weather_code (从current获取)
     wx_code = _safe_int(cur.get('weather_code', 0))
 
-    # 拼接7个段落
     L = []
     L += _header(now)
+    # 实况 (核心)
     L += _section_current(cur, uno, wx_code, wentian, stale_note)
+    # 今日预报 (核心)
     if daily.get('time'):
-        L += _section_today(daily, hourly, now.date())
-    L += _section_short_fusion(ult)
-    L += _section_analysis(wentian)
-    L += _section_llm_analysis()
+        L += _section_today(daily, hourly, now.date(), wentian, wx_code)
+    # 短临 + 24h合并为一段
+    L += ['', '━━━ ⏱ 短临 + 未来24h ━━━']
+    fus = _section_short_fusion(ult)
+    h24 = _section_24h()
+    L += fus[1:4] if len(fus) > 3 else ['  短临: 数据正常']
+    L += h24[1:5] if len(h24) > 4 else []
+    # 航空评估 (新增)
+    L += ['', '━━━ ✈️ 长水运行风险评估(CAAC) ━━━']
+    L += get_aviation_summary()
+    # 综合分析 + 钦天监 (去重, 单标题统一收编)
+    # 旧版两标题"🏮 钦天监+AI分析"+"🧿 钦天监·中国传统天象"重复, 主人2026-09-11要求整合
+    L += ['', '━━━ 🧠 综合分析 + 🏮 钦天监 ━━━']
+    # 1. 多源融合分析 (跳过空行+自带'🧠 综合分析·模型结论'标题)
+    analysis = _section_analysis(wentian)
+    L += analysis[2:] if len(analysis) > 2 else []
+    # 2. 钦天监 (含自有标题🧿, 紧接在综合分析后)
+    if HAS_QINTIANJIAN:
+        try:
+            L += _qintianjian_render(get_qintianjian())
+        except Exception as _e:
+            print(f'[qintianjian] 渲染失败: {_e}')
+    # 未来6天 (核心)
     if daily.get('time'):
-        L += _section_6day(daily)
-        L += _section_indices(cur, daily)
+        L += ['', '━━━ 📅 未来6天 ━━━']
+        L += _section_6day(daily, wentian, wx_code)[1:]
+    # 尾部
     L += _section_footer(ult, alerts, wentian)
 
     return '\n'.join(L)
@@ -946,15 +1663,24 @@ def main() -> bool:
     uno = get_uno()
 
     # ⚠ 修复(2026-09-07): 推送前重新生成ultimate_forecast.json, 避免用29h前的陈腐数据
+    # ⚠ 修复(2026-09-11): 三处 subprocess 超时均未捕获 TimeoutExpired → 未捕获异常
+    # 直接把 systemd 服务打成 failed(9/10起每3h崩一次的路径之一)。
+    # 且外层180s预算 < LLM内层最坏366s(3×120s超时+重试退避) — 倒挂必炸。统一:
+    # 内层llm脚本已把单次超时降到45s; 外层预算240s; 全部try包住。
     import subprocess
-    ult_ok = subprocess.run(
-        [sys.executable, '/root/scripts/ultimate_predict.py', '--once'],
-        capture_output=True, text=True, timeout=120
-    )
-    if ult_ok.returncode == 0:
-        print('[Ultimate] ✅ 终极预测已重新生成')
-    else:
-        print(f'[Ultimate] ⚠ 重新生成失败 (rc={ult_ok.returncode}): {ult_ok.stderr[:200]}')
+    try:
+        ult_ok = subprocess.run(
+            [sys.executable, '/root/scripts/ultimate_predict.py', '--once'],
+            capture_output=True, text=True, timeout=120
+        )
+        if ult_ok.returncode == 0:
+            print('[Ultimate] ✅ 终极预测已重新生成')
+        else:
+            print(f'[Ultimate] ⚠ 重新生成失败 (rc={ult_ok.returncode}): {ult_ok.stderr[:200] if ult_ok.stderr else ""}')
+    except subprocess.TimeoutExpired:
+        print('[Ultimate] ⚠ 超时(120s), 用现有缓存')
+    except Exception as e:
+        print(f'[Ultimate] ⚠ 异常: {e}')
     ult = get_ult_fusion()
     chronos = get_chronos()
     kriging = get_kriging()
@@ -966,15 +1692,34 @@ def main() -> bool:
     else:
         print('[问天] ⚠ wentian_latest.json 不存在, 问天可能未运行')
 
-    # v8.0: LLM深度分析
+    # v8.0: LLM深度分析 (修复: 超时捕获+预算240s)
     print('[LLM] 调用DeepSeek分析多源数据...')
     import subprocess
-    llm_ok = subprocess.run([sys.executable, '/root/scripts/llm_weather_analyst.py'],
-                           capture_output=True, text=True, timeout=180)
-    if llm_ok.returncode == 0:
-        print('[LLM] ✅ 分析完毕')
-    else:
-        print(f'[LLM] ⚠ 分析失败 (rc={llm_ok.returncode}): {llm_ok.stderr[:200]}')
+    try:
+        llm_ok = subprocess.run([sys.executable, '/root/scripts/llm_weather_analyst.py'],
+                               capture_output=True, text=True, timeout=240)
+        if llm_ok.returncode == 0:
+            print('[LLM] ✅ 分析完毕')
+        else:
+            print(f'[LLM] ⚠ 分析失败 (rc={llm_ok.returncode}): {llm_ok.stderr[:200] if llm_ok.stderr else ""}')
+    except subprocess.TimeoutExpired:
+        print('[LLM] ⚠ 分析超时(240s), 跳过AI分析段')
+    except Exception as e:
+        print(f'[LLM] ⚠ 异常: {e}')
+
+    # v2.0: Google DeepMind 交叉印证
+    print('[Google] 交叉印证...')
+    try:
+        google_ok = subprocess.run([sys.executable, '/root/scripts/wentian/google_validate.py'],
+                                   capture_output=True, text=True, timeout=60)
+        if google_ok.returncode == 0:
+            print('[Google] ✅ 交叉印证完成')
+        else:
+            print(f'[Google] ⚠ 印证失败 (rc={google_ok.returncode}): {google_ok.stderr[:200] if google_ok.stderr else ""}')
+    except subprocess.TimeoutExpired:
+        print('[Google] ⚠ 印证超时(60s), 跳过')
+    except Exception as e:
+        print(f'[Google] ⚠ 异常: {e}')
 
     # 2. 拼消息
     msg = build_message(om, uno, ult, chronos, kriging, alerts, wentian)
